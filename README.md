@@ -65,6 +65,7 @@ The following arguments are supported:
 - `--delay` to customize the delay (in milliseconds) between a webcam event being detected and toggling your Litra. When your webcam turns on or off, multiple events may be generated in quick succession. Setting a delay allows the program to wait for all events before taking action, avoiding flickering. Defaults to 1.5 seconds (1500 milliseconds).
 - `--verbose` to enable verbose logging
 - `--back` to toggle the back light on Litra Beam LX devices. When enabled, the back light will be turned on/off together with the front light.
+- `--fade` to fade the light in and out over the given number of milliseconds (e.g. `--fade 1000`) instead of switching it instantly. When fading in, the light ramps up from its minimum brightness to the brightness it was last set to. Defaults to 0 (no fade).
 
 > [!NOTE]
 > Only one filter (`--serial-number`, `--device-path`, or `--device-type`) can be specified at a time.
@@ -107,6 +108,11 @@ Create a YAML file (e.g., `config.yml`) with your desired options:
 # the back light by setting the option below to true.
 #
 # back: true
+#
+# By default, the light switches on and off instantly. You can make it fade in and out
+# instead by setting a fade duration (in milliseconds) below.
+#
+# fade: 1000
 ```
 
 Then run:
@@ -127,6 +133,7 @@ All command-line options can be specified in the configuration file using unders
 - `delay` (number, in milliseconds)
 - `verbose` (boolean)
 - `back` (boolean, toggles the back light on Litra Beam LX devices)
+- `fade` (number, in milliseconds)
 
 **Important notes:**
 

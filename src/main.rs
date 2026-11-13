@@ -1,8 +1,8 @@
 use clap::Parser;
 #[cfg(target_os = "linux")]
 use inotify::{EventMask, Inotify, WatchMask};
-use litra::{Device, DeviceError, DeviceHandle, Litra};
-use log::{error, info, warn};
+use litra::{Device, DeviceError, DeviceHandle, DeviceResult, Litra};
+use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::fs;
@@ -47,6 +47,9 @@ struct AppConfig {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     back: Option<bool>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fade: Option<u64>,
 }
 
 /// Automatically turn your Logitech Litra device on when your webcam turns on, and off when your webcam turns off.
@@ -119,6 +122,14 @@ struct Cli {
         help = "Toggle the back light on Litra Beam LX devices. When enabled, the back light will be turned on/off together with the front light."
     )]
     back: bool,
+
+    #[clap(
+        long,
+        short = 'f',
+        default_value = "0",
+        help = "Fade the light in and out over this many milliseconds instead of switching it instantly (e.g. `1000`). When fading in, the light ramps up from its minimum brightness to the brightness it was last set to. By default, the light switches instantly."
+    )]
+    fade: u64,
 }
 
 fn check_device_filters<'a>(
@@ -289,6 +300,12 @@ fn merge_config_with_cli(mut cli: Cli) -> Result<Cli, CliError> {
         if !cli.back {
             cli.back = config.back.unwrap_or(false);
         }
+        // Only use config fade if CLI has the default value (0)
+        if cli.fade == 0 {
+            if let Some(fade) = config.fade {
+                cli.fade = fade;
+            }
+        }
     }
 
     // Validate device_type if specified via CLI or config
@@ -379,6 +396,88 @@ fn toggle_back_light_if_applicable(device_handle: &DeviceHandle, on: bool, back:
     }
 }
 
+/// How many brightness steps to send per second of fade. Each step is one HID
+/// write, so this also caps the write rate, which matters for Bluetooth devices.
+const FADE_STEPS_PER_SECOND: u64 = 20;
+
+/// The brightness levels to step through when fading from `start` to `end`,
+/// excluding `start` and ending exactly on `end`. Returns no steps if
+/// `start == end`.
+fn fade_steps(start: u16, end: u16, fade_ms: u64) -> Vec<u16> {
+    let distance = u64::from(start.abs_diff(end));
+    let count = (fade_ms * FADE_STEPS_PER_SECOND / 1000).clamp(1, distance.max(1));
+    if distance == 0 {
+        return Vec::new();
+    }
+    (1..=count)
+        .map(|i| {
+            let offset = (distance * i / count) as u16;
+            if end > start {
+                start + offset
+            } else {
+                start - offset
+            }
+        })
+        .collect()
+}
+
+/// Steps through `levels` evenly over `fade_ms`, setting the brightness at each step.
+///
+/// This blocks the current thread, like the rest of the device I/O here. Fades
+/// are short (around a second) and run in their own task.
+fn step_brightness(device_handle: &DeviceHandle, levels: &[u16], fade_ms: u64) -> DeviceResult<()> {
+    let interval =
+        std::time::Duration::from_millis(fade_ms / u64::try_from(levels.len().max(1)).unwrap_or(1));
+    for &level in levels {
+        device_handle.set_brightness_in_lumen(level)?;
+        std::thread::sleep(interval);
+    }
+    Ok(())
+}
+
+/// Turns the device on, fading in from minimum brightness to its current
+/// brightness setting over `fade_ms`. With `fade_ms == 0`, or if the device is
+/// already on, it just turns the device on.
+fn fade_on(device_handle: &DeviceHandle, fade_ms: u64) -> DeviceResult<()> {
+    if fade_ms == 0 || device_handle.is_on()? {
+        return device_handle.set_on(true);
+    }
+
+    let target = device_handle.brightness_in_lumen()?;
+    let minimum = device_handle.minimum_brightness_in_lumen();
+    debug!("Fading in from {minimum} lm to {target} lm over {fade_ms}ms");
+
+    device_handle.set_brightness_in_lumen(minimum)?;
+    device_handle.set_on(true)?;
+    step_brightness(
+        device_handle,
+        &fade_steps(minimum, target, fade_ms),
+        fade_ms,
+    )
+}
+
+/// Turns the device off, fading out from its current brightness to minimum
+/// brightness over `fade_ms`, then restores the original brightness setting so
+/// the next turn-on uses it. With `fade_ms == 0`, or if the device is already
+/// off, it just turns the device off.
+fn fade_off(device_handle: &DeviceHandle, fade_ms: u64) -> DeviceResult<()> {
+    if fade_ms == 0 || !device_handle.is_on()? {
+        return device_handle.set_on(false);
+    }
+
+    let original = device_handle.brightness_in_lumen()?;
+    let minimum = device_handle.minimum_brightness_in_lumen();
+    debug!("Fading out from {original} lm to {minimum} lm over {fade_ms}ms");
+
+    step_brightness(
+        device_handle,
+        &fade_steps(original, minimum, fade_ms),
+        fade_ms,
+    )?;
+    device_handle.set_on(false)?;
+    device_handle.set_brightness_in_lumen(original)
+}
+
 fn turn_on_all_supported_devices_and_log(
     context: &mut Litra,
     serial_number: Option<&str>,
@@ -386,6 +485,7 @@ fn turn_on_all_supported_devices_and_log(
     device_type: Option<&str>,
     require_device: bool,
     back: bool,
+    fade: u64,
 ) -> Result<(), CliError> {
     let device_handles = get_all_supported_devices(
         context,
@@ -406,7 +506,7 @@ fn turn_on_all_supported_devices_and_log(
             );
 
             // Ignore errors for individual devices when targeting multiple
-            if let Err(e) = device_handle.set_on(true) {
+            if let Err(e) = fade_on(&device_handle, fade) {
                 warn!(
                     "Failed to turn on {} device (serial number: {}): {}",
                     device_handle.device_type(),
@@ -429,6 +529,7 @@ fn turn_off_all_supported_devices_and_log(
     device_type: Option<&str>,
     require_device: bool,
     back: bool,
+    fade: u64,
 ) -> Result<(), CliError> {
     let device_handles = get_all_supported_devices(
         context,
@@ -449,7 +550,7 @@ fn turn_off_all_supported_devices_and_log(
             );
 
             // Ignore errors for individual devices when targeting multiple
-            if let Err(e) = device_handle.set_on(false) {
+            if let Err(e) = fade_off(&device_handle, fade) {
                 warn!(
                     "Failed to turn off {} device (serial number: {}): {}",
                     device_handle.device_type(),
@@ -491,6 +592,7 @@ async fn handle_autotoggle_command(
     require_device: bool,
     delay: u64,
     back: bool,
+    fade: u64,
 ) -> CliResult {
     // Wrap context in Arc<Mutex<>> to enable sharing across tasks
     let context = Arc::new(Mutex::new(Litra::new()?));
@@ -602,6 +704,7 @@ async fn handle_autotoggle_command(
                         device_type_clone.as_deref(),
                         require_device,
                         back,
+                        fade,
                     );
                 } else {
                     info!("Attempting to turn off Litra device(s)...");
@@ -612,6 +715,7 @@ async fn handle_autotoggle_command(
                         device_type_clone.as_deref(),
                         require_device,
                         back,
+                        fade,
                     );
                 }
             }
@@ -620,6 +724,7 @@ async fn handle_autotoggle_command(
 }
 
 #[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
 async fn handle_autotoggle_command(
     serial_number: Option<&str>,
     device_path: Option<&str>,
@@ -628,6 +733,7 @@ async fn handle_autotoggle_command(
     video_device: Option<&str>,
     delay: u64,
     back: bool,
+    fade: u64,
 ) -> CliResult {
     // Wrap context in Arc<Mutex<>> to enable sharing across tasks
     let context = Arc::new(Mutex::new(Litra::new()?));
@@ -750,6 +856,7 @@ async fn handle_autotoggle_command(
                         device_type_clone.as_deref(),
                         require_device,
                         back,
+                        fade,
                     );
                 } else {
                     info!("Attempting to turn off Litra device(s)...");
@@ -760,6 +867,7 @@ async fn handle_autotoggle_command(
                         device_type_clone.as_deref(),
                         require_device,
                         back,
+                        fade,
                     );
                 }
             }
@@ -785,6 +893,7 @@ async fn handle_autotoggle_command(
     require_device: bool,
     delay: u64,
     back: bool,
+    fade: u64,
 ) -> CliResult {
     // Wrap context in Arc<Mutex<>> to enable sharing across tasks
     let context = Arc::new(Mutex::new(Litra::new()?));
@@ -920,6 +1029,7 @@ async fn handle_autotoggle_command(
                             device_type_clone.as_deref(),
                             require_device,
                             back,
+                            fade,
                         );
                     } else {
                         info!("Attempting to turn off Litra device(s)...");
@@ -930,6 +1040,7 @@ async fn handle_autotoggle_command(
                             device_type_clone.as_deref(),
                             require_device,
                             back,
+                            fade,
                         );
                     }
                 }
@@ -1202,6 +1313,7 @@ async fn main() -> ExitCode {
         args.require_device,
         args.delay,
         args.back,
+        args.fade,
     )
     .await;
 
@@ -1242,6 +1354,7 @@ async fn main() -> ExitCode {
         args.video_device.as_deref(),
         args.delay,
         args.back,
+        args.fade,
     )
     .await;
 
@@ -1281,6 +1394,7 @@ async fn main() -> ExitCode {
         args.require_device,
         args.delay,
         args.back,
+        args.fade,
     )
     .await;
 
@@ -1595,6 +1709,47 @@ delay: 2000
 
         assert_eq!(config.device_type, Some("glow".to_string()));
         assert_eq!(config.delay, Some(2000));
+    }
+
+    #[test]
+    fn test_fade_steps_up_ends_on_target() {
+        let steps = fade_steps(30, 400, 1000);
+        assert_eq!(steps.len(), 20);
+        assert_eq!(*steps.last().unwrap(), 400);
+        assert!(steps.windows(2).all(|w| w[0] < w[1]));
+        assert!(steps[0] > 30);
+    }
+
+    #[test]
+    fn test_fade_steps_down_ends_on_target() {
+        let steps = fade_steps(400, 30, 1000);
+        assert_eq!(steps.len(), 20);
+        assert_eq!(*steps.last().unwrap(), 30);
+        assert!(steps.windows(2).all(|w| w[0] > w[1]));
+    }
+
+    #[test]
+    fn test_fade_steps_never_repeats_levels() {
+        // Only 5 lm apart, so at most 5 distinct steps even over a long fade.
+        let steps = fade_steps(30, 35, 2000);
+        assert_eq!(steps, vec![31, 32, 33, 34, 35]);
+    }
+
+    #[test]
+    fn test_fade_steps_short_fade_is_single_step() {
+        assert_eq!(fade_steps(30, 400, 10), vec![400]);
+    }
+
+    #[test]
+    fn test_fade_steps_same_level_is_empty() {
+        assert!(fade_steps(100, 100, 1000).is_empty());
+    }
+
+    #[test]
+    fn test_load_valid_config_fade_option() {
+        let config_file = create_temp_config("fade: 1000\n");
+        let config = load_config_file(&config_file.path().to_path_buf()).unwrap();
+        assert_eq!(config.fade, Some(1000));
     }
 
     #[test]

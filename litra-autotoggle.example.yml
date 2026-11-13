@@ -42,3 +42,8 @@
 # the back light by setting the option below to true.
 #
 # back: true
+#
+# By default, the light switches on and off instantly. You can make it fade in and out
+# instead by setting a fade duration (in milliseconds) below.
+#
+# fade: 1000
